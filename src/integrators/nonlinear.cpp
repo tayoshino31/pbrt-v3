@@ -39,8 +39,79 @@
 #include "paramset.h"
 #include "scene.h"
 #include "stats.h"
+#include <random>
 
 namespace pbrt {
+
+Float get_n(Float height){
+    Float n0 = 1.000;
+    Float dn_dh = 5e-4;
+    Float n = n0 + dn_dh * height;
+    return n;
+}
+
+Float sampleTemperature(Point3f pos) {
+    static thread_local std::mt19937 rng(std::random_device{}());
+    static thread_local std::uniform_real_distribution<Float> dist(-0.01, 0.01); // ±2°C のノイズ
+
+    Float baseTemp;
+    if (pos.y > 1.0)
+        baseTemp = 20.0;
+    else {
+        Float dh = 30;
+        baseTemp = 50.0 - dh * pos.y;
+    }
+
+    return baseTemp + dist(rng); // ノイズを加える
+}
+
+Float computeRefractiveIndex(Float temperatureC, Float pressurePa = 101325.0f) {
+    // Convert temperature to Kelvin
+    Float T = temperatureC + 273.15f;
+
+    // Standard pressure in Pa
+    constexpr Float P0 = 101325.0f;
+
+    // Standard temperature in Kelvin (15°C)
+    constexpr Float T0 = 288.15f;
+
+    // Standard refractive index of air at STP (dry air)
+    constexpr Float n0 = 1.000293f;
+
+    // Scale with pressure and inverse temperature (ideal gas law approximation)
+    return 1.0f +  (n0 - 1.0f) * (pressurePa / P0) * (T0 / T); //TODO remove * 50---------------------------
+}
+
+// Float computeRefractiveIndex(Float temperatureC, Float pressurePa = 101325.0f) {
+//     const float c1 = 0.0000104f;
+//     const float c2 = 0.00366f;
+//     Float numerator = c1 * pressurePa * (1.0f + pressurePa * (60.1f - 0.972f * temperatureC) * 1e-10f);
+//     Float denominator = 1.0f + c2 * temperatureC;
+//     return numerator / denominator;
+// }
+
+Vector3f refract(Vector3f d1, Vector3f normal, Float n1, Float n2){
+    d1 = Normalize(d1);
+    normal  = Normalize(normal);
+
+    Float eta = n1 / n2;
+    Float cosTheta1 = Dot(d1, normal);
+
+    // 光が内側から出ていくとき：法線を反転し eta も逆に
+    if (cosTheta1 < 0.0f) {
+        std::swap(n1, n2);
+        eta = n1 / n2;
+        normal = -normal;
+        cosTheta1 = Dot(d1, normal); 
+    }
+
+    Float sinTheta1 = std::sqrt(1.0f - cosTheta1 * cosTheta1);
+    Float sintheta2 = eta * sinTheta1;
+    Float costheta2 = std::sqrt(1.0f - sintheta2 * sintheta2);
+    if(sintheta2 >= 1.0f) return Reflect(-d1, normal); // Total internal reflection
+    Vector3f d2 = eta * d1 + (eta * cosTheta1 - costheta2) * normal;
+    return Normalize(d2);
+}
 
 STAT_INT_DISTRIBUTION("Integrator/Path length", pathLength);
 STAT_COUNTER("Integrator/Volume interactions", volumeInteractions);
@@ -71,8 +142,34 @@ Spectrum NonLinearIntegrator::Li(const RayDifferential &r, const Scene &scene,
 
     for (bounces = 0;; ++bounces) {
         // Intersect _ray_ with scene and store intersection in _isect_
+        //SurfaceInteraction isect;
+        //bool foundIntersection = scene.Intersect(ray, &isect);
+
         SurfaceInteraction isect;
-        bool foundIntersection = scene.Intersect(ray, &isect);
+        Point3f prev_position = ray.o;
+        bool foundIntersection;
+        Float delta_x = 0.001;
+        for (int i_step = 0; i_step < 500; ++i_step){
+            foundIntersection = scene.Intersect(ray, &isect);
+            if(Distance(prev_position, isect.p) < delta_x)
+                break;    
+            if (isect.p.x < 0.0f || isect.p.x > 180.0f ||
+                isect.p.y < 0.0f || isect.p.y > 0.1f ||
+                isect.p.z < -4.0f || isect.p.z > 4.0f) {
+                break;
+            }
+            ray.o += ray.d * delta_x;
+
+            //update ray direction based on refaction
+            Float n1 = get_n(prev_position.y);  //computeRefractiveIndex(sampleTemperature(prev_position));
+            Float n2 = get_n(ray.o.y); //computeRefractiveIndex(sampleTemperature(ray.o));
+            ray.d = refract(ray.d, {0,1,0}, n1, n2);
+
+            prev_position = ray.o;
+
+            //printf("Radiance: %f %f\n", n1, n2);
+            //printf("Radiance: %f %f %f\n", prev_position[0], prev_position[1], prev_position[2]);
+        }
 
         // Sample the participating medium, if present
         MediumInteraction mi;
